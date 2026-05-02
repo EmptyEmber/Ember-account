@@ -23,9 +23,6 @@ jobs:
     env:
       LICENSE_DAYS: "90"
       LICENSE_EDITION: free
-      GITEE_OWNER: ${{ vars.GITEE_OWNER }}
-      GITEE_REPO: ${{ vars.GITEE_REPO }}
-      GITEE_ISSUE_NUMBER: ${{ vars.GITEE_ISSUE_NUMBER }}
       GITEE_ACCESS_TOKEN: ${{ secrets.GITEE_ACCESS_TOKEN }}
       EMBER_LICENSE_PRIVATE_KEY_B64: ${{ secrets.EMBER_LICENSE_PRIVATE_KEY_B64 }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -114,16 +111,6 @@ jobs:
               commentId,
               href: url.href,
             };
-          }
-
-          function requireGiteeTarget(parsed) {
-            const owner = requireValue(env.GITEE_OWNER, '请先在 GitHub Variables 设置 GITEE_OWNER');
-            const repo = requireValue(env.GITEE_REPO, '请先在 GitHub Variables 设置 GITEE_REPO');
-            const number = requireValue(env.GITEE_ISSUE_NUMBER, '请先在 GitHub Variables 设置 GITEE_ISSUE_NUMBER');
-
-            if (parsed.owner !== owner || parsed.repo !== repo || parsed.number !== number) {
-              throw new Error(`Gitee 评论必须来自指定 issue: https://gitee.com/${owner}/${repo}/issues/${number}`);
-            }
           }
 
           function userCandidates(comment) {
@@ -276,7 +263,6 @@ jobs:
 
             const giteeUserId = assertSafeGiteeUserId(readIssueField('Gitee 用户 ID'));
             const giteeComment = parseGiteeIssueUrl(readIssueField('Gitee 评论链接'));
-            requireGiteeTarget(giteeComment);
             await findVerifiedGiteeComment(giteeComment, giteeUserId, machineCode);
 
             const result = issueLicense(machineCode, giteeUserId, giteeComment.href);
