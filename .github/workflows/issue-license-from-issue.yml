@@ -1,0 +1,308 @@
+name: Issue Ember License From Issue
+
+on:
+  issues:
+    types:
+      - opened
+      - edited
+      - reopened
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: ember-license-issue
+  cancel-in-progress: false
+
+jobs:
+  issue:
+    if: github.event.issue.state == 'open' && contains(github.event.issue.labels.*.name, 'license-request')
+    runs-on: ubuntu-latest
+
+    env:
+      LICENSE_DAYS: "90"
+      LICENSE_EDITION: free
+      GITEE_OWNER: ${{ vars.GITEE_OWNER }}
+      GITEE_REPO: ${{ vars.GITEE_REPO }}
+      GITEE_ISSUE_NUMBER: ${{ vars.GITEE_ISSUE_NUMBER }}
+      GITEE_ACCESS_TOKEN: ${{ secrets.GITEE_ACCESS_TOKEN }}
+      EMBER_LICENSE_PRIVATE_KEY_B64: ${{ secrets.EMBER_LICENSE_PRIVATE_KEY_B64 }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Validate Gitee comment and issue license
+        shell: bash
+        run: |
+          node <<'NODE'
+          const { createHash, createSign, randomUUID } = require('node:crypto');
+          const { execFileSync, spawnSync } = require('node:child_process');
+          const { existsSync, mkdirSync, readFileSync, writeFileSync } = require('node:fs');
+          const { dirname } = require('node:path');
+
+          const env = process.env;
+          const event = JSON.parse(readFileSync(env.GITHUB_EVENT_PATH, 'utf8'));
+          const issue = event.issue;
+          const [repoOwner, repoName] = env.GITHUB_REPOSITORY.split('/');
+
+          function requireValue(value, message) {
+            if (!value || !String(value).trim()) throw new Error(message);
+            return String(value).trim();
+          }
+
+          function escapeRegExp(value) {
+            return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          }
+
+          function readIssueField(label) {
+            const body = issue.body || '';
+            const pattern = new RegExp(`###\\s*${escapeRegExp(label)}\\s*\\n+([\\s\\S]*?)(?=\\n###\\s|$)`, 'i');
+            const match = body.match(pattern);
+            const value = match?.[1]?.replace(/<!--.*?-->/gs, '').trim();
+            if (!value || value === '_No response_') return '';
+            return value;
+          }
+
+          function normalizeMachineCode(value) {
+            return requireValue(value, '缺少机器码').trim().toUpperCase();
+          }
+
+          function normalizeMachineText(value) {
+            return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+          }
+
+          function sha256Hex(value) {
+            return createHash('sha256').update(value, 'utf8').digest('hex');
+          }
+
+          function base64Url(buffer) {
+            return Buffer.from(buffer)
+              .toString('base64')
+              .replace(/=+$/u, '')
+              .replace(/\+/gu, '-')
+              .replace(/\//gu, '_');
+          }
+
+          function assertSafeGiteeUserId(value) {
+            const userId = requireValue(value, '缺少 Gitee 用户 ID');
+            if (!/^[a-zA-Z0-9_.-]{1,64}$/.test(userId)) {
+              throw new Error('Gitee 用户 ID 只能包含字母、数字、点、下划线和短横线');
+            }
+            return userId;
+          }
+
+          function parseGiteeIssueUrl(value) {
+            const url = new URL(requireValue(value, '缺少 Gitee 评论链接'));
+            if (url.hostname !== 'gitee.com') {
+              throw new Error('Gitee 评论链接必须来自 gitee.com');
+            }
+
+            const match = url.pathname.match(/^\/([^/]+)\/([^/]+)\/issues\/([^/]+)$/);
+            if (!match) {
+              throw new Error('Gitee 评论链接格式无效，路径应包含 /owner/repo/issues/issue_number');
+            }
+
+            const hash = decodeURIComponent(url.hash || '');
+            const commentId = hash.match(/(?:note_|comment-|issuecomment-)?(\d+)/i)?.[1] || '';
+            return {
+              owner: match[1],
+              repo: match[2],
+              number: match[3],
+              commentId,
+              href: url.href,
+            };
+          }
+
+          function requireGiteeTarget(parsed) {
+            const owner = requireValue(env.GITEE_OWNER, '请先在 GitHub Variables 设置 GITEE_OWNER');
+            const repo = requireValue(env.GITEE_REPO, '请先在 GitHub Variables 设置 GITEE_REPO');
+            const number = requireValue(env.GITEE_ISSUE_NUMBER, '请先在 GitHub Variables 设置 GITEE_ISSUE_NUMBER');
+
+            if (parsed.owner !== owner || parsed.repo !== repo || parsed.number !== number) {
+              throw new Error(`Gitee 评论必须来自指定 issue: https://gitee.com/${owner}/${repo}/issues/${number}`);
+            }
+          }
+
+          function userCandidates(comment) {
+            const user = comment.user || {};
+            const values = [
+              user.login,
+              user.name,
+              user.id,
+              user.html_url ? String(user.html_url).split('/').filter(Boolean).pop() : '',
+            ];
+            return values.filter(Boolean).map(value => String(value).toLowerCase());
+          }
+
+          async function fetchGiteeComments(parsed) {
+            const comments = [];
+            for (let page = 1; page <= 10; page += 1) {
+              const apiUrl = new URL(`https://gitee.com/api/v5/repos/${parsed.owner}/${parsed.repo}/issues/${parsed.number}/comments`);
+              apiUrl.searchParams.set('page', String(page));
+              apiUrl.searchParams.set('per_page', '100');
+              if (env.GITEE_ACCESS_TOKEN) apiUrl.searchParams.set('access_token', env.GITEE_ACCESS_TOKEN);
+
+              const response = await fetch(apiUrl);
+              if (!response.ok) {
+                throw new Error(`读取 Gitee 评论失败: HTTP ${response.status}`);
+              }
+
+              const items = await response.json();
+              if (!Array.isArray(items)) {
+                throw new Error('读取 Gitee 评论失败: 响应格式无效');
+              }
+
+              comments.push(...items);
+              if (items.length < 100) break;
+            }
+            return comments;
+          }
+
+          async function findVerifiedGiteeComment(parsed, giteeUserId, machineCode) {
+            const comments = await fetchGiteeComments(parsed);
+            const expectedUser = giteeUserId.toLowerCase();
+            const expectedMachine = normalizeMachineText(machineCode);
+
+            const matched = comments.find(comment => {
+              if (parsed.commentId && String(comment.id) !== parsed.commentId) return false;
+              if (!userCandidates(comment).includes(expectedUser)) return false;
+              return normalizeMachineText(comment.body).includes(expectedMachine);
+            });
+
+            if (!matched) {
+              throw new Error('未找到匹配的 Gitee 评论，请确认评论账号和机器码一致');
+            }
+
+            return matched;
+          }
+
+          async function githubApi(method, path, body) {
+            const response = await fetch(`https://api.github.com${path}`, {
+              method,
+              headers: {
+                Accept: 'application/vnd.github+json',
+                Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+                'Content-Type': 'application/json',
+                'X-GitHub-Api-Version': '2022-11-28',
+              },
+              body: body ? JSON.stringify(body) : undefined,
+            });
+
+            if (!response.ok) {
+              const text = await response.text();
+              throw new Error(`GitHub API ${method} ${path} 失败: HTTP ${response.status} ${text}`);
+            }
+
+            return response.status === 204 ? null : response.json();
+          }
+
+          async function commentIssue(message) {
+            await githubApi('POST', `/repos/${repoOwner}/${repoName}/issues/${issue.number}/comments`, { body: message });
+          }
+
+          function issueLicense(machineCode, giteeUserId, giteeCommentUrl) {
+            const privateKeyB64 = requireValue(env.EMBER_LICENSE_PRIVATE_KEY_B64, '缺少 GitHub Secret: EMBER_LICENSE_PRIVATE_KEY_B64');
+            const privateKey = Buffer.from(privateKeyB64, 'base64').toString('utf8');
+            const days = Number.parseInt(env.LICENSE_DAYS || '90', 10);
+            if (!Number.isFinite(days) || days <= 0) throw new Error('LICENSE_DAYS 必须是大于 0 的整数');
+
+            const machineCodeHash = sha256Hex(machineCode);
+            const accountPath = `accounts/gitee/${giteeUserId}.json`;
+            const licensePath = `licenses/${machineCodeHash}.lic`;
+
+            if (existsSync(accountPath)) {
+              const account = JSON.parse(readFileSync(accountPath, 'utf8'));
+              if (account.machineCodeHash && account.machineCodeHash !== machineCodeHash) {
+                throw new Error(`该 Gitee 用户已绑定其他机器码: ${account.machineCodeHash}`);
+              }
+            }
+
+            const issuedAt = new Date();
+            const expiresAt = new Date(issuedAt.getTime() + days * 24 * 60 * 60 * 1000);
+            const payload = {
+              product: 'Ember',
+              licenseId: randomUUID(),
+              licenseeProvider: 'gitee',
+              licenseeUserId: giteeUserId,
+              machineCodeHash,
+              edition: env.LICENSE_EDITION || 'free',
+              issuedAtUtc: issuedAt.toISOString(),
+              expiresAtUtc: expiresAt.toISOString(),
+            };
+
+            const payloadBytes = Buffer.from(JSON.stringify(payload), 'utf8');
+            const signature = createSign('RSA-SHA256')
+              .update(payloadBytes)
+              .end()
+              .sign(privateKey);
+
+            mkdirSync(dirname(accountPath), { recursive: true });
+            mkdirSync(dirname(licensePath), { recursive: true });
+
+            writeFileSync(accountPath, `${JSON.stringify({
+              provider: 'gitee',
+              userId: giteeUserId,
+              machineCodeHash,
+              giteeCommentUrl,
+              githubIssue: issue.html_url,
+              updatedAtUtc: issuedAt.toISOString(),
+            }, null, 2)}\n`, 'utf8');
+
+            writeFileSync(licensePath, `${base64Url(payloadBytes)}.${base64Url(signature)}\n`, 'utf8');
+            return { machineCodeHash, licensePath, expiresAtUtc: payload.expiresAtUtc };
+          }
+
+          function commitLicenseFiles(issueNumber) {
+            execFileSync('git', ['config', 'user.name', 'github-actions[bot]'], { stdio: 'inherit' });
+            execFileSync('git', ['config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'], { stdio: 'inherit' });
+            execFileSync('git', ['add', 'accounts', 'licenses'], { stdio: 'inherit' });
+
+            const diff = spawnSync('git', ['diff', '--cached', '--quiet']);
+            if (diff.status === 0) return false;
+
+            execFileSync('git', ['commit', '-m', `feat: 签发 Ember 授权 #${issueNumber}`], { stdio: 'inherit' });
+            execFileSync('git', ['push'], { stdio: 'inherit' });
+            return true;
+          }
+
+          async function main() {
+            const machineCode = normalizeMachineCode(readIssueField('机器码'));
+            if (!/^[A-Z0-9]{4}(?:-[A-Z0-9]{4}){5}$/.test(machineCode)) {
+              throw new Error('机器码格式无效，请从 Ember 授权页复制完整机器码');
+            }
+
+            const giteeUserId = assertSafeGiteeUserId(readIssueField('Gitee 用户 ID'));
+            const giteeComment = parseGiteeIssueUrl(readIssueField('Gitee 评论链接'));
+            requireGiteeTarget(giteeComment);
+            await findVerifiedGiteeComment(giteeComment, giteeUserId, machineCode);
+
+            const result = issueLicense(machineCode, giteeUserId, giteeComment.href);
+            commitLicenseFiles(issue.number);
+
+            await commentIssue([
+              '授权已签发。',
+              '',
+              `- 授权账号: \`gitee/${giteeUserId}\``,
+              `- 机器码哈希: \`${result.machineCodeHash}\``,
+              `- 到期时间: \`${result.expiresAtUtc}\``,
+              `- 授权文件: \`${result.licensePath}\``,
+              '',
+              '请回到 Ember 授权页点击“刷新授权”。',
+            ].join('\n'));
+
+            await githubApi('PATCH', `/repos/${repoOwner}/${repoName}/issues/${issue.number}`, { state: 'closed' });
+          }
+
+          main().catch(async error => {
+            console.error(error);
+            try {
+              await commentIssue(`授权签发失败: ${error.message}`);
+            } catch (commentError) {
+              console.error(commentError);
+            }
+            process.exit(1);
+          });
+          NODE
