@@ -1,9 +1,0 @@
-{
-  "provider": "gitee",
-  "userId": "test-user",
-  "machineCodeHash": "7a7aec510f9892f6bc19ff0e4b1a735b906fe1e4a8a6f010741d5c96bf471ba7",
-  "edition": "free",
-  "issuedAtUtc": "2026-05-02T15:16:35.515Z",
-  "expiresAtUtc": "2026-05-09T15:16:35.515Z",
-  "licenseFile": "licenses/7a7aec510f9892f6bc19ff0e4b1a735b906fe1e4a8a6f010741d5c96bf471ba7.lic"
-}
