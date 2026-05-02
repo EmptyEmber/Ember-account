@@ -1,5 +1,5 @@
 name: Ember 授权申请
-description: 已在 Gitee 指定 issue 评论机器码后，在这里提交授权申请。
+description: 已在 Gitee issue 评论机器码后，在这里提交授权申请。
 title: "[授权申请] "
 labels:
   - license-request
@@ -7,14 +7,15 @@ body:
   - type: markdown
     attributes:
       value: |
-        请先在指定 Gitee issue 中使用自己的 Gitee 账号评论机器码，再提交本申请。
+        请先使用自己的 Gitee 账号在任意公开 Gitee issue 中评论机器码，再提交本申请。
         GitHub Action 会自动校验 Gitee 评论并签发当前机器授权。
+        同一个 Gitee 用户更换设备时，重新提交申请会自动换绑到新机器。
   - type: input
     id: machine_code
     attributes:
       label: 机器码
-      description: 从 Ember 授权页复制，格式类似 WBV7-UD2U-GAMJ-XHEF-TRB5-N74G。
-      placeholder: WBV7-UD2U-GAMJ-XHEF-TRB5-N74G
+      description: 从 Ember 授权页复制，格式类似 WBV7-UD2U-GAMJ-XHEF-TRB6-N75G。
+      placeholder: WBV7-UD2U-GAMJ-XHEF-TRB6-N75G
     validations:
       required: true
   - type: input
@@ -29,7 +30,7 @@ body:
     id: gitee_comment_url
     attributes:
       label: Gitee 评论链接
-      description: 填写你在指定 Gitee issue 评论机器码后的评论链接，至少需要是对应 issue 链接。
+      description: 填写你在 Gitee issue 评论机器码后的评论链接，至少需要是对应 issue 链接。
       placeholder: https://gitee.com/owner/repo/issues/IXXXXXX#note_123456
     validations:
       required: true
