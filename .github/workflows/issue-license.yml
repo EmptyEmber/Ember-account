@@ -1,0 +1,148 @@
+name: Issue Ember License
+
+on:
+  workflow_dispatch:
+    inputs:
+      machine_code:
+        description: "Ember 授权页显示的机器码"
+        required: true
+        type: string
+      provider:
+        description: "授权来源平台"
+        required: true
+        default: "gitee"
+        type: string
+      user_id:
+        description: "授权来源用户 ID"
+        required: true
+        type: string
+      days:
+        description: "授权天数"
+        required: true
+        default: "90"
+        type: string
+      edition:
+        description: "授权版本"
+        required: true
+        default: "free"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  issue:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate license
+        env:
+          EMBER_LICENSE_PRIVATE_KEY_B64: ${{ secrets.EMBER_LICENSE_PRIVATE_KEY_B64 }}
+          MACHINE_CODE: ${{ inputs.machine_code }}
+          PROVIDER: ${{ inputs.provider }}
+          USER_ID: ${{ inputs.user_id }}
+          DAYS: ${{ inputs.days }}
+          EDITION: ${{ inputs.edition }}
+        run: |
+          node <<'NODE'
+          const fs = require('fs')
+          const path = require('path')
+          const { createHash, createSign, randomUUID } = require('crypto')
+
+          function fail(message) {
+            console.error(message)
+            process.exit(1)
+          }
+
+          function base64Url(buffer) {
+            return Buffer.from(buffer)
+              .toString('base64')
+              .replace(/=+$/g, '')
+              .replace(/\+/g, '-')
+              .replace(/\//g, '_')
+          }
+
+          function sha256Hex(value) {
+            return createHash('sha256').update(value, 'utf8').digest('hex')
+          }
+
+          const privateKeyB64 = process.env.EMBER_LICENSE_PRIVATE_KEY_B64 || ''
+          const machineCode = (process.env.MACHINE_CODE || '').trim()
+          const provider = (process.env.PROVIDER || 'gitee').trim()
+          const userId = (process.env.USER_ID || '').trim()
+          const edition = (process.env.EDITION || 'free').trim()
+          const days = Number.parseInt(process.env.DAYS || '90', 10)
+
+          if (!privateKeyB64) fail('缺少 EMBER_LICENSE_PRIVATE_KEY_B64 Secret')
+          if (!machineCode) fail('缺少机器码')
+          if (!userId) fail('缺少用户 ID')
+          if (!Number.isFinite(days) || days <= 0) fail('授权天数必须大于 0')
+
+          const machineCodeHash = sha256Hex(machineCode)
+          const safeProvider = provider.replace(/[^a-zA-Z0-9_.-]/g, '_')
+          const safeUserId = userId.replace(/[^a-zA-Z0-9_.-]/g, '_')
+          const accountDir = path.join('accounts', safeProvider)
+          const accountFile = path.join(accountDir, `${safeUserId}.json`)
+          const licenseDir = 'licenses'
+          const licenseFile = path.join(licenseDir, `${machineCodeHash}.lic`)
+
+          fs.mkdirSync(accountDir, { recursive: true })
+          fs.mkdirSync(licenseDir, { recursive: true })
+
+          if (fs.existsSync(accountFile)) {
+            const existing = JSON.parse(fs.readFileSync(accountFile, 'utf8'))
+            if (existing.machineCodeHash && existing.machineCodeHash !== machineCodeHash) {
+              fail(`该用户已绑定其他机器码: ${existing.machineCodeHash}`)
+            }
+          }
+
+          const issuedAt = new Date()
+          const expiresAt = new Date(issuedAt.getTime() + days * 24 * 60 * 60 * 1000)
+          const payload = {
+            product: 'Ember',
+            licenseId: randomUUID(),
+            licenseeProvider: provider,
+            licenseeUserId: userId,
+            machineCodeHash,
+            edition,
+            issuedAtUtc: issuedAt.toISOString(),
+            expiresAtUtc: expiresAt.toISOString()
+          }
+
+          const payloadBytes = Buffer.from(JSON.stringify(payload), 'utf8')
+          const privateKey = Buffer.from(privateKeyB64, 'base64').toString('utf8')
+          const signature = createSign('RSA-SHA256')
+            .update(payloadBytes)
+            .end()
+            .sign(privateKey)
+
+          fs.writeFileSync(licenseFile, `${base64Url(payloadBytes)}.${base64Url(signature)}\n`, 'utf8')
+          fs.writeFileSync(accountFile, JSON.stringify({
+            provider,
+            userId,
+            machineCodeHash,
+            edition,
+            issuedAtUtc: payload.issuedAtUtc,
+            expiresAtUtc: payload.expiresAtUtc,
+            licenseFile
+          }, null, 2) + '\n', 'utf8')
+
+          console.log(`授权文件: ${licenseFile}`)
+          console.log(`机器码哈希: ${machineCodeHash}`)
+          console.log(`到期时间: ${payload.expiresAtUtc}`)
+          NODE
+
+      - name: Commit license
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add licenses accounts
+          if git diff --cached --quiet; then
+            echo "没有授权文件变更"
+          else
+            git commit -m "feat: 签发 Ember 授权"
+            git push
+          fi
