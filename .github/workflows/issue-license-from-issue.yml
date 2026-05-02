@@ -37,7 +37,7 @@ jobs:
           node <<'NODE'
           const { createHash, createSign, randomUUID } = require('node:crypto');
           const { execFileSync, spawnSync } = require('node:child_process');
-          const { existsSync, mkdirSync, readFileSync, writeFileSync } = require('node:fs');
+          const { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } = require('node:fs');
           const { dirname } = require('node:path');
 
           const env = process.env;
@@ -199,11 +199,23 @@ jobs:
             const machineCodeHash = sha256Hex(machineCode);
             const accountPath = `accounts/gitee/${giteeUserId}.json`;
             const licensePath = `licenses/${machineCodeHash}.lic`;
+            let rebind = null;
 
             if (existsSync(accountPath)) {
               const account = JSON.parse(readFileSync(accountPath, 'utf8'));
               if (account.machineCodeHash && account.machineCodeHash !== machineCodeHash) {
-                throw new Error(`该 Gitee 用户已绑定其他机器码: ${account.machineCodeHash}`);
+                const previousLicensePath = typeof account.licensePath === 'string' && account.licensePath.startsWith('licenses/')
+                  ? account.licensePath
+                  : `licenses/${account.machineCodeHash}.lic`;
+
+                if (existsSync(previousLicensePath)) {
+                  unlinkSync(previousLicensePath);
+                }
+
+                rebind = {
+                  previousMachineCodeHash: account.machineCodeHash,
+                  previousLicensePath,
+                };
               }
             }
 
@@ -233,13 +245,14 @@ jobs:
               provider: 'gitee',
               userId: giteeUserId,
               machineCodeHash,
+              licensePath,
               giteeCommentUrl,
               githubIssue: issue.html_url,
               updatedAtUtc: issuedAt.toISOString(),
             }, null, 2)}\n`, 'utf8');
 
             writeFileSync(licensePath, `${base64Url(payloadBytes)}.${base64Url(signature)}\n`, 'utf8');
-            return { machineCodeHash, licensePath, expiresAtUtc: payload.expiresAtUtc };
+            return { machineCodeHash, licensePath, expiresAtUtc: payload.expiresAtUtc, rebind };
           }
 
           function commitLicenseFiles(issueNumber) {
@@ -269,12 +282,16 @@ jobs:
             commitLicenseFiles(issue.number);
 
             await commentIssue([
-              '授权已签发。',
+              result.rebind ? '授权已自动换绑并重新签发。' : '授权已签发。',
               '',
               `- 授权账号: \`gitee/${giteeUserId}\``,
               `- 机器码哈希: \`${result.machineCodeHash}\``,
               `- 到期时间: \`${result.expiresAtUtc}\``,
               `- 授权文件: \`${result.licensePath}\``,
+              ...(result.rebind ? [
+                `- 旧机器码哈希: \`${result.rebind.previousMachineCodeHash}\``,
+                `- 旧远端授权文件: \`${result.rebind.previousLicensePath}\` 已删除`,
+              ] : []),
               '',
               '请回到 Ember 授权页点击“刷新授权”。',
             ].join('\n'));
