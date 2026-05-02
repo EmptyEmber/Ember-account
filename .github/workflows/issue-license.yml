@@ -1,4 +1,4 @@
-name: Issue Ember License
+name: 手动签发 Ember 授权
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ on:
       days:
         description: "授权天数"
         required: true
-        default: "90"
+        default: "30"
         type: string
       edition:
         description: "授权版本"
@@ -30,119 +30,190 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ember-license-manual
+  cancel-in-progress: false
+
 jobs:
   issue:
     runs-on: ubuntu-latest
 
+    env:
+      MACHINE_CODE: ${{ inputs.machine_code }}
+      LICENSE_PROVIDER: ${{ inputs.provider }}
+      LICENSE_USER_ID: ${{ inputs.user_id }}
+      LICENSE_DAYS: ${{ inputs.days }}
+      LICENSE_EDITION: ${{ inputs.edition }}
+      EMBER_LICENSE_PRIVATE_KEY_B64: ${{ secrets.EMBER_LICENSE_PRIVATE_KEY_B64 }}
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Generate license
-        env:
-          EMBER_LICENSE_PRIVATE_KEY_B64: ${{ secrets.EMBER_LICENSE_PRIVATE_KEY_B64 }}
-          MACHINE_CODE: ${{ inputs.machine_code }}
-          PROVIDER: ${{ inputs.provider }}
-          USER_ID: ${{ inputs.user_id }}
-          DAYS: ${{ inputs.days }}
-          EDITION: ${{ inputs.edition }}
+      - name: Issue license
+        shell: bash
         run: |
           node <<'NODE'
-          const fs = require('fs')
-          const path = require('path')
-          const { createHash, createSign, randomUUID } = require('crypto')
+          const { createHash, createSign, randomUUID } = require('node:crypto');
+          const { execFileSync, spawnSync } = require('node:child_process');
+          const { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } = require('node:fs');
+          const { dirname } = require('node:path');
 
-          function fail(message) {
-            console.error(message)
-            process.exit(1)
+          const env = process.env;
+
+          function requireValue(value, message) {
+            if (!value || !String(value).trim()) throw new Error(message);
+            return String(value).trim();
+          }
+
+          function normalizeMachineCode(value) {
+            return requireValue(value, '缺少机器码').trim().toUpperCase();
+          }
+
+          function assertSafeSegment(value, label) {
+            const text = requireValue(value, `缺少${label}`);
+            if (!/^[a-zA-Z0-9_.-]{1,64}$/.test(text)) {
+              throw new Error(`${label}只能包含字母、数字、点、下划线和短横线`);
+            }
+            return text;
+          }
+
+          function sha256Hex(value) {
+            return createHash('sha256').update(value, 'utf8').digest('hex');
           }
 
           function base64Url(buffer) {
             return Buffer.from(buffer)
               .toString('base64')
-              .replace(/=+$/g, '')
-              .replace(/\+/g, '-')
-              .replace(/\//g, '_')
+              .replace(/=+$/u, '')
+              .replace(/\+/gu, '-')
+              .replace(/\//gu, '_');
           }
 
-          function sha256Hex(value) {
-            return createHash('sha256').update(value, 'utf8').digest('hex')
-          }
-
-          const privateKeyB64 = process.env.EMBER_LICENSE_PRIVATE_KEY_B64 || ''
-          const machineCode = (process.env.MACHINE_CODE || '').trim()
-          const provider = (process.env.PROVIDER || 'gitee').trim()
-          const userId = (process.env.USER_ID || '').trim()
-          const edition = (process.env.EDITION || 'free').trim()
-          const days = Number.parseInt(process.env.DAYS || '90', 10)
-
-          if (!privateKeyB64) fail('缺少 EMBER_LICENSE_PRIVATE_KEY_B64 Secret')
-          if (!machineCode) fail('缺少机器码')
-          if (!userId) fail('缺少用户 ID')
-          if (!Number.isFinite(days) || days <= 0) fail('授权天数必须大于 0')
-
-          const machineCodeHash = sha256Hex(machineCode)
-          const safeProvider = provider.replace(/[^a-zA-Z0-9_.-]/g, '_')
-          const safeUserId = userId.replace(/[^a-zA-Z0-9_.-]/g, '_')
-          const accountDir = path.join('accounts', safeProvider)
-          const accountFile = path.join(accountDir, `${safeUserId}.json`)
-          const licenseDir = 'licenses'
-          const licenseFile = path.join(licenseDir, `${machineCodeHash}.lic`)
-
-          fs.mkdirSync(accountDir, { recursive: true })
-          fs.mkdirSync(licenseDir, { recursive: true })
-
-          if (fs.existsSync(accountFile)) {
-            const existing = JSON.parse(fs.readFileSync(accountFile, 'utf8'))
-            if (existing.machineCodeHash && existing.machineCodeHash !== machineCodeHash) {
-              fail(`该用户已绑定其他机器码: ${existing.machineCodeHash}`)
+          function readPositiveInteger(value, label, fallback) {
+            const number = Number.parseInt(value || fallback, 10);
+            if (!Number.isFinite(number) || number <= 0) {
+              throw new Error(`${label}必须是大于 0 的整数`);
             }
+            return number;
           }
 
-          const issuedAt = new Date()
-          const expiresAt = new Date(issuedAt.getTime() + days * 24 * 60 * 60 * 1000)
-          const payload = {
-            product: 'Ember',
-            licenseId: randomUUID(),
-            licenseeProvider: provider,
-            licenseeUserId: userId,
-            machineCodeHash,
-            edition,
-            issuedAtUtc: issuedAt.toISOString(),
-            expiresAtUtc: expiresAt.toISOString()
+          function issueLicense(machineCode, provider, userId) {
+            const privateKeyB64 = requireValue(env.EMBER_LICENSE_PRIVATE_KEY_B64, '缺少 GitHub Secret: EMBER_LICENSE_PRIVATE_KEY_B64');
+            const privateKey = Buffer.from(privateKeyB64, 'base64').toString('utf8');
+            const days = readPositiveInteger(env.LICENSE_DAYS, '授权天数', '30');
+            const edition = requireValue(env.LICENSE_EDITION || 'free', '缺少授权版本');
+
+            const machineCodeHash = sha256Hex(machineCode);
+            const accountPath = `accounts/${provider}/${userId}.json`;
+            const licensePath = `licenses/${machineCodeHash}.lic`;
+            let rebind = null;
+
+            if (existsSync(accountPath)) {
+              const account = JSON.parse(readFileSync(accountPath, 'utf8'));
+              if (account.machineCodeHash && account.machineCodeHash !== machineCodeHash) {
+                const previousLicensePath = typeof account.licensePath === 'string' && account.licensePath.startsWith('licenses/')
+                  ? account.licensePath
+                  : `licenses/${account.machineCodeHash}.lic`;
+
+                if (existsSync(previousLicensePath)) {
+                  unlinkSync(previousLicensePath);
+                }
+
+                rebind = {
+                  previousMachineCodeHash: account.machineCodeHash,
+                  previousLicensePath,
+                };
+              }
+            }
+
+            const issuedAt = new Date();
+            const expiresAt = new Date(issuedAt.getTime() + days * 24 * 60 * 60 * 1000);
+            const payload = {
+              product: 'Ember',
+              licenseId: randomUUID(),
+              licenseeProvider: provider,
+              licenseeUserId: userId,
+              machineCodeHash,
+              edition,
+              issuedAtUtc: issuedAt.toISOString(),
+              expiresAtUtc: expiresAt.toISOString(),
+            };
+
+            const payloadBytes = Buffer.from(JSON.stringify(payload), 'utf8');
+            const signature = createSign('RSA-SHA256')
+              .update(payloadBytes)
+              .end()
+              .sign(privateKey);
+
+            mkdirSync(dirname(accountPath), { recursive: true });
+            mkdirSync(dirname(licensePath), { recursive: true });
+
+            writeFileSync(accountPath, `${JSON.stringify({
+              provider,
+              userId,
+              machineCodeHash,
+              licensePath,
+              manual: true,
+              githubRun: `${env.GITHUB_SERVER_URL}/${env.GITHUB_REPOSITORY}/actions/runs/${env.GITHUB_RUN_ID}`,
+              updatedAtUtc: issuedAt.toISOString(),
+            }, null, 2)}\n`, 'utf8');
+
+            writeFileSync(licensePath, `${base64Url(payloadBytes)}.${base64Url(signature)}\n`, 'utf8');
+            return { provider, userId, machineCodeHash, licensePath, expiresAtUtc: payload.expiresAtUtc, rebind };
           }
 
-          const payloadBytes = Buffer.from(JSON.stringify(payload), 'utf8')
-          const privateKey = Buffer.from(privateKeyB64, 'base64').toString('utf8')
-          const signature = createSign('RSA-SHA256')
-            .update(payloadBytes)
-            .end()
-            .sign(privateKey)
+          function commitLicenseFiles(result) {
+            execFileSync('git', ['config', 'user.name', 'github-actions[bot]'], { stdio: 'inherit' });
+            execFileSync('git', ['config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'], { stdio: 'inherit' });
+            execFileSync('git', ['add', 'accounts', 'licenses'], { stdio: 'inherit' });
 
-          fs.writeFileSync(licenseFile, `${base64Url(payloadBytes)}.${base64Url(signature)}\n`, 'utf8')
-          fs.writeFileSync(accountFile, JSON.stringify({
-            provider,
-            userId,
-            machineCodeHash,
-            edition,
-            issuedAtUtc: payload.issuedAtUtc,
-            expiresAtUtc: payload.expiresAtUtc,
-            licenseFile
-          }, null, 2) + '\n', 'utf8')
+            const diff = spawnSync('git', ['diff', '--cached', '--quiet']);
+            if (diff.status === 0) return false;
 
-          console.log(`授权文件: ${licenseFile}`)
-          console.log(`机器码哈希: ${machineCodeHash}`)
-          console.log(`到期时间: ${payload.expiresAtUtc}`)
+            execFileSync('git', ['commit', '-m', `feat: 手动签发 Ember 授权 ${result.provider}/${result.userId}`], { stdio: 'inherit' });
+            execFileSync('git', ['push'], { stdio: 'inherit' });
+            return true;
+          }
+
+          function writeSummary(result, committed) {
+            const lines = [
+              '## Ember 授权已手动签发',
+              '',
+              `- 授权账号: \`${result.provider}/${result.userId}\``,
+              `- 机器码哈希: \`${result.machineCodeHash}\``,
+              `- 到期时间: \`${result.expiresAtUtc}\``,
+              `- 授权文件: \`${result.licensePath}\``,
+              `- 已提交仓库: \`${committed ? '是' : '否'}\``,
+            ];
+
+            if (result.rebind) {
+              lines.push(
+                `- 旧机器码哈希: \`${result.rebind.previousMachineCodeHash}\``,
+                `- 旧远端授权文件: \`${result.rebind.previousLicensePath}\` 已删除`,
+              );
+            }
+
+            writeFileSync(env.GITHUB_STEP_SUMMARY, `${lines.join('\n')}\n`, 'utf8');
+          }
+
+          function main() {
+            const machineCode = normalizeMachineCode(env.MACHINE_CODE);
+            if (!/^[A-Z0-9]{4}(?:-[A-Z0-9]{4}){5}$/.test(machineCode)) {
+              throw new Error('机器码格式无效，请从 Ember 授权页复制完整机器码');
+            }
+
+            const provider = assertSafeSegment(env.LICENSE_PROVIDER || 'gitee', '授权来源平台');
+            const userId = assertSafeSegment(env.LICENSE_USER_ID, '授权来源用户 ID');
+            const result = issueLicense(machineCode, provider, userId);
+            const committed = commitLicenseFiles(result);
+            writeSummary(result, committed);
+
+            console.log(result.rebind ? '授权已自动换绑并手动签发。' : '授权已手动签发。');
+            console.log(`授权账号: ${result.provider}/${result.userId}`);
+            console.log(`授权文件: ${result.licensePath}`);
+            console.log(`到期时间: ${result.expiresAtUtc}`);
+          }
+
+          main();
           NODE
-
-      - name: Commit license
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add licenses accounts
-          if git diff --cached --quiet; then
-            echo "没有授权文件变更"
-          else
-            git commit -m "feat: 签发 Ember 授权"
-            git push
-          fi
