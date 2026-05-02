@@ -17,7 +17,11 @@ concurrency:
 
 jobs:
   issue:
-    if: github.event.issue.state == 'open' && contains(github.event.issue.labels.*.name, 'license-request')
+    if: >-
+      github.event.issue.state == 'open' &&
+      contains(github.event.issue.body, '### 机器码') &&
+      contains(github.event.issue.body, '### Gitee 用户 ID') &&
+      contains(github.event.issue.body, '### Gitee 评论链接')
     runs-on: ubuntu-latest
 
     env:
