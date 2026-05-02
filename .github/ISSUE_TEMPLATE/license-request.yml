@@ -1,8 +1,6 @@
 name: Ember 授权申请
 description: 已在 Gitee issue 评论机器码后，在这里提交授权申请。
 title: "[授权申请] "
-labels:
-  - license-request
 body:
   - type: markdown
     attributes:
@@ -14,8 +12,8 @@ body:
     id: machine_code
     attributes:
       label: 机器码
-      description: 从 Ember 授权页复制，格式类似 WBV7-UD2U-GAMJ-XHEF-TRB6-N75G。
-      placeholder: WBV7-UD2U-GAMJ-XHEF-TRB6-N75G
+      description: 从 Ember 授权页复制，格式类似 WBV7-UD2U-GAMJ-XHEF-TRB5-N74G。
+      placeholder: WBV7-UD2U-GAMJ-XHEF-TRB5-N74G
     validations:
       required: true
   - type: input
